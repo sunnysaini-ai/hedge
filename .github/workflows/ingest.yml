@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch raw sources (git-scrape: commit only if changed)
+      - name: "Fetch raw sources (git-scrape: commit only if changed)"
         run: |
           mkdir -p data/raw
           curl -sL --max-time 120 -H "User-Agent: openpolls-bot/0.1 (contact: you@example.org)" \
