@@ -1,0 +1,40 @@
+name: Ingest polls (VoteHub + 538 archive → Supabase)
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # every 6 hours, off the top of the hour on purpose
+  workflow_dispatch: {}       # manual "Run workflow" button
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch raw sources (git-scrape: commit only if changed)
+        run: |
+          mkdir -p data/raw
+          curl -sL --max-time 120 -H "User-Agent: openpolls-bot/0.1 (contact: you@example.org)" \
+            "https://api.votehub.com/polls" -o data/raw/votehub_polls.json
+          curl -sL --max-time 60 \
+            "https://raw.githubusercontent.com/fivethirtyeight/data/master/pollster-ratings/pollster-ratings-combined.csv" \
+            -o data/raw/538_pollster_ratings.csv
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: pip install psycopg2-binary
+
+      - name: Load into Supabase Postgres
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}   # Supabase project -> Settings -> Database -> Connection string (URI)
+        run: python supabase/load.py
+
+      - name: Commit raw snapshot if changed (audit trail)
+        run: |
+          git config user.name "openpolls-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add data/raw
+          git diff --cached --quiet || git commit -m "data: refresh raw snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push

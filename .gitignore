@@ -1,0 +1,21 @@
+node_modules/
+.next/
+.env
+.env.local
+__pycache__/
+*.pyc
+# local scratch / static-prototype artifacts (superseded by supabase/ + web/)
+/OpenPolls-prototype-code.zip
+/OpenPolls-scaffold.zip
+/OpenPolls-prototype.html
+/shot-dark.png
+/shot-light.png
+/shot.mjs
+/site/
+/package.json
+/package-lock.json
+/etl.py
+/validate.py
+/build_site.py
+/supabase/batches/
+/data/clean/
