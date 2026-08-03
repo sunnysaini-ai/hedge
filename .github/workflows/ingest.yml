@@ -11,14 +11,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify SUPABASE_DB_URL secret exists
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error title=Missing secret::SUPABASE_DB_URL is empty or not set. Add it under Settings -> Secrets and variables -> Actions (name must be exactly SUPABASE_DB_URL)."
+            exit 1
+          fi
+          echo "Secret present (${#DATABASE_URL} chars)"
+
       - name: "Fetch raw sources (git-scrape: commit only if changed)"
         run: |
           mkdir -p data/raw
-          curl -sL --max-time 120 -H "User-Agent: openpolls-bot/0.1 (contact: you@example.org)" \
-            "https://api.votehub.com/polls" -o data/raw/votehub_polls.json
-          curl -sL --max-time 60 \
+          curl -fsSL --max-time 120 -H "User-Agent: openpolls-bot/0.1 (contact: you@example.org)" \
+            "https://api.votehub.com/polls" -o data/raw/votehub_polls.json \
+            || { echo "::error title=Fetch failed::VoteHub API fetch failed"; exit 1; }
+          curl -fsSL --max-time 60 \
             "https://raw.githubusercontent.com/fivethirtyeight/data/master/pollster-ratings/pollster-ratings-combined.csv" \
-            -o data/raw/538_pollster_ratings.csv
+            -o data/raw/538_pollster_ratings.csv \
+            || { echo "::error title=Fetch failed::538 pollster-ratings fetch failed"; exit 1; }
 
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
@@ -28,8 +40,14 @@ jobs:
 
       - name: Load into Supabase Postgres
         env:
-          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}   # Supabase project -> Settings -> Database -> Connection string (URI)
-        run: python supabase/load.py
+          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}   # Supabase dashboard -> Connect -> Connection String (URI, pooler)
+        run: |
+          set -o pipefail
+          if ! python supabase/load.py 2>&1 | tee load_out.txt; then
+            msg=$(tail -c 700 load_out.txt | tr '\n' ' ')
+            echo "::error title=load.py failed::${msg}"
+            exit 1
+          fi
 
       - name: Commit raw snapshot if changed (audit trail)
         run: |
