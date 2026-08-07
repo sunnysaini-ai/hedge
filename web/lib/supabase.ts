@@ -47,6 +47,8 @@ export type RaceAverage = {
   polls_used: number;
   latest_poll: string | null;
   low_data: boolean;
+  avg_grade: number | null;
+  matchup_source: "nominees" | "co-polling" | null;
 };
 
 export type GenericBallotDay = {

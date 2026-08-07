@@ -3,6 +3,7 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { MAP_VIEWBOX, STATE_PATHS } from "../lib/usmap.gen";
 import type { RaceAverage } from "../lib/supabase";
+import { formatGrade } from "./grades";
 
 // ---- color math (precomputed hex — no runtime CSS color-mix dependency) ----
 
@@ -139,13 +140,14 @@ export default function StateMap({
       <p className="mapsummary">
         {rows.length} races polled · D leads {dLeads} · R leads {rLeads}
       </p>
+      <p className="maphint">Click a state for the full race page.</p>
 
       <svg viewBox={MAP_VIEWBOX} className="usmap" role="img"
            aria-label={`Map of 2026 ${OFFICE_LABEL[office]} polling averages by state`}
            onMouseLeave={() => setHover(null)}>
         {codes.map((code) => {
           const row = byState.get(code);
-          return (
+          const shape = (
             <path
               key={code}
               d={STATE_PATHS[code].d}
@@ -161,6 +163,21 @@ export default function StateMap({
                   : `${STATE_PATHS[code].name} — no ${OFFICE_LABEL[office]} race`}
               </title>
             </path>
+          );
+          // States with a race link to their detail page via an SVG <a>, which
+          // keeps native <title> tooltips, the custom hover card, and keyboard
+          // activation (focusable + Enter) without extra handlers. States
+          // without a race stay plain, non-clickable paths.
+          return row ? (
+            <a
+              key={code}
+              href={`/race/${code.toLowerCase()}/${office}`}
+              aria-label={`${STATE_PATHS[code].name} ${OFFICE_LABEL[office]} race page`}
+            >
+              {shape}
+            </a>
+          ) : (
+            shape
           );
         })}
         {/* Re-draw hovered state on top so its outline isn't hidden by neighbors */}
@@ -200,11 +217,16 @@ export default function StateMap({
               {hoverRow.low_data ? (
                 <div className="t3 lim">
                   Limited polling ({hoverRow.polls_used} poll{hoverRow.polls_used === 1 ? "" : "s"}) · latest {fmtDate(hoverRow.latest_poll)}
+                  {hoverRow.matchup_source === "nominees" && <> · nominees ✓</>}
                 </div>
               ) : (
                 <div className="t3">
                   {fmtMargin(hoverRow.margin)} · {hoverRow.polls_used} polls · latest {fmtDate(hoverRow.latest_poll)}
+                  {hoverRow.matchup_source === "nominees" && <> · nominees ✓</>}
                 </div>
+              )}
+              {hoverRow.avg_grade != null && (
+                <div className="t3">Avg pollster grade: {formatGrade(hoverRow.avg_grade)}</div>
               )}
             </>
           ) : (
@@ -222,9 +244,14 @@ export default function StateMap({
           font-size:.84rem; color:var(--text-secondary); cursor:pointer; }
         .seg button + button { border-left:1px solid var(--line); }
         .seg button.on { background:var(--surface-1); color:var(--text-primary); font-weight:600; }
-        .mapsummary { color:var(--text-secondary); font-size:.86rem; margin:8px 0 4px; }
+        .mapsummary { color:var(--text-secondary); font-size:.86rem; margin:8px 0 0; }
+        .maphint { color:var(--text-secondary); font-size:.78rem; margin:2px 0 4px; }
         .usmap { width:100%; height:auto; display:block; }
         .usmap path { transition: fill .15s ease; cursor:default; }
+        .usmap a { cursor:pointer; }
+        .usmap a path { cursor:pointer; }
+        .usmap a:focus-visible path { stroke:var(--text-primary); stroke-width:1.5; }
+        .usmap a:focus:not(:focus-visible) { outline:none; }
         .legend { display:flex; flex-wrap:wrap; gap:6px 14px; margin-top:10px;
           font-size:.76rem; color:var(--text-secondary); }
         .legend i { display:inline-block; width:12px; height:12px; border-radius:3px;

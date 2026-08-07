@@ -1,7 +1,9 @@
 import { supabase } from "../lib/supabase";
-import type { ApprovalDay, RaceAverage } from "../lib/supabase";
+import type { ApprovalDay, GenericBallotDay, RaceAverage } from "../lib/supabase";
 import StateMap from "./StateMap";
+import KeyRaces from "./KeyRaces";
 import ApprovalTracker from "./ApprovalTracker";
+import GenericBallotChart from "./GenericBallotChart";
 
 export const revalidate = 3600; // static-ish; ETL runs on its own schedule, page rebuilds hourly
 
@@ -48,7 +50,7 @@ async function getData() {
   const approval: Record<string, ApprovalDay[]> = {};
   for (const row of approvalRows) (approval[row.subject] ??= []).push(row);
   return {
-    series: series ?? [],
+    series: (series ?? []) as GenericBallotDay[],
     pollsters: pollsters ?? [],
     pollCount,
     pollsterCount,
@@ -60,7 +62,6 @@ async function getData() {
 
 export default async function Page() {
   const { series, pollsters, pollCount, pollsterCount, senate, governor, approval } = await getData();
-  const last = series[series.length - 1];
 
   return (
     <main className="wrap">
@@ -72,6 +73,8 @@ export default async function Page() {
 
       <StateMap senate={senate} governor={governor} />
 
+      <KeyRaces senate={senate} governor={governor} />
+
       <ApprovalTracker series={approval} />
 
       <div className="tiles">
@@ -80,15 +83,7 @@ export default async function Page() {
         <div className="tile"><div className="k">Cost to run</div><div className="v">$0–25/mo</div></div>
       </div>
 
-      {last && (
-        <div className="card">
-          <h2>Generic congressional ballot</h2>
-          <div className="hero" style={{ color: last.margin > 0 ? "var(--dem)" : "var(--rep)" }}>
-            {last.margin > 0 ? "D" : "R"}+{Math.abs(last.margin)}
-          </div>
-          <p className="note">{last.dem}% Dem · {last.rep}% Rep · as of {last.date} · {last.polls_in_window} polls in window</p>
-        </div>
-      )}
+      <GenericBallotChart series={series} />
 
       <div className="card">
         <h2>Pollster registry (rated)</h2>

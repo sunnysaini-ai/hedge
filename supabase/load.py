@@ -11,7 +11,11 @@ import psycopg2.extras as pgx
 
 DB = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/openpolls")
 RAW = "data/raw"
-RETRIEVED = "2026-08-01"
+# The date this ETL run actually fetched the source data. Must be the real run
+# date, never a hardcoded constant — `polls.retrieved_at` is an audit field and
+# a frozen value makes it worse than useless (it asserts a fetch that didn't
+# happen on that date).
+RETRIEVED = dt.date.today().isoformat()
 
 conn = psycopg2.connect(DB)
 conn.autocommit = False
@@ -158,7 +162,26 @@ pgx.execute_values(cur, """
 #   quality_weight = 0.6 + 0.4*(numeric_grade/3) if rated, else 0.8
 # Partisan-sponsored and internal polls are excluded (and were never inserted
 # as gb candidates below if incomplete).
-HALF_LIFE, ASOF = 30.0, dt.date(2026, 8, 1)
+#
+# SERIES END-BOUND (methodology decision, 2026-08-07): the series HARD-STOPS at
+# the end_date of the most recent real generic-ballot poll. It does not run
+# forward to the run date.
+#
+# Why: this site's premise is that every published number is auditable back to
+# polls that exist. Extrapolating past the last poll emits daily rows that look
+# like new information but are just the same fixed poll set re-decayed — and
+# because the trailing window is 120 days, the line would keep drifting for
+# months after polling stopped, with `polls_in_window` quietly falling toward 3.
+# A chart that ends on the last real data point tells the reader the truth
+# ("nobody has polled this since 2026-06-30"); one that runs to today implies a
+# freshness we don't have. This also matches refresh_approval_averages(), which
+# already generates days only out to max(end_date) per subject, so the two
+# derived series now answer "as of when?" the same way.
+#
+# Consequence for consumers: the front end should label the series with its last
+# date rather than assuming it ends today, and /methodology needs updating (it
+# still describes the old extrapolate-to-ASOF behavior).
+HALF_LIFE = 30.0
 grade_by_pollster = {r["id"]: r["fte_numeric_grade"] for r in registry_rows}
 
 gb = []
@@ -184,8 +207,9 @@ for p in polls:
 gb.sort(key=lambda r: r["end_date"])
 gb_series = []
 if gb:
+    asof = gb[-1]["end_date"]          # last real poll wins; see note above
     day = gb[0]["end_date"] + dt.timedelta(days=20)
-    while day <= ASOF:
+    while day <= asof:
         num_d = num_r = den = 0.0
         used = 0
         for r in gb:
