@@ -215,6 +215,120 @@ if findings:
 
 conn.commit()
 
+# ------------------------------------- geography / candidates / race_averages
+# Idempotent post-processing over what's now in `polls`/`poll_answers`. Every
+# statement is a `where col is null` backfill or an `on conflict do nothing`
+# seed, so re-running this on an unchanged DB touches 0 rows. The one rule
+# that must never be violated: never overwrite a non-null `candidates.party`
+# — that column is a human/agent-curated registry, not ETL output.
+geo_steps = []
+
+# 1. cycle: leading 4-digit year in `subject`, e.g. '2026 Texas' -> 2026.
+cur.execute(r"""
+    update polls set cycle = substring(subject from '^(\d{4})')::int
+    where subject ~ '^\d{4}' and cycle is null
+""")
+geo_steps.append(("polls.cycle backfilled", cur.rowcount))
+
+# 2. office: derived straight from poll_type.
+cur.execute("""
+    update polls set office = case poll_type
+        when 'us-senator'        then 'senate'
+        when 'governor'          then 'governor'
+        when 'us-representative' then 'house'
+        when 'attorney-general'  then 'attorney-general'
+        when 'mayor'             then 'mayor'
+    end
+    where office is null
+      and poll_type in ('us-senator', 'governor', 'us-representative',
+                         'attorney-general', 'mayor')
+""")
+geo_steps.append(("polls.office backfilled", cur.rowcount))
+
+# 3. race_class: subject ending in a bare party name (optionally + "Primary")
+# is a primary; so is any presidential-primary poll_type; everything else
+# still gets a value ('general') so this column is never left ambiguous.
+cur.execute(r"""
+    update polls set race_class = case
+        when subject ~ '\m(Democratic|Republican|Dem|GOP)\s*(Primary)?\s*$' then 'primary'
+        when poll_type = 'presidential-primary' then 'primary'
+        else 'general'
+    end
+    where race_class is null
+""")
+geo_steps.append(("polls.race_class backfilled", cur.rowcount))
+
+# 4. district rows: subject like '2026 AK-01' -> state 'AK', district 'AK-01'.
+# Runs before the statewide step below so those rows are already spoken for.
+cur.execute(r"""
+    update polls set
+        state    = substring(subject from '^\d{4}\s+([A-Z]{2})-'),
+        district = substring(subject from '^\d{4}\s+([A-Z]{2}-\S+)')
+    where subject ~ '^\d{4}\s+[A-Z]{2}-' and state is null
+""")
+geo_steps.append(("polls.state/district (house) backfilled", cur.rowcount))
+
+# 5. statewide rows: match subject against us_states.name, longest name first
+# via the LATERAL's `order by length(name) desc limit 1` — so a New Hampshire
+# poll can never resolve to 'Hampshire' (not a state) and a West Virginia poll
+# never resolves to 'Virginia'.
+cur.execute("""
+    update polls p
+    set state = (
+        select s.code
+        from us_states s
+        where position(s.name in p.subject) > 0
+        order by length(s.name) desc
+        limit 1
+    )
+    where p.state is null and p.subject is not null
+      and exists (select 1 from us_states s2 where position(s2.name in p.subject) > 0)
+""")
+geo_steps.append(("polls.state (statewide) backfilled", cur.rowcount))
+
+# 6. seed candidates: one identity row per distinct answer choice seen in a
+# 2026 general senate/governor poll. party/party_source are left null here —
+# this step only registers *who exists*, never *what party they are*.
+cur.execute("""
+    insert into candidates (state, office, cycle, name)
+    select distinct p.state, p.office, p.cycle, pa.choice
+    from polls p
+    join poll_answers pa on pa.poll_id = p.id
+    where p.cycle = 2026 and p.race_class = 'general'
+      and p.office in ('senate', 'governor') and p.state is not null
+    on conflict (state, office, cycle, name) do nothing
+""")
+geo_steps.append(("candidates seeded", cur.rowcount))
+
+# 7. auto-classify ONLY the unambiguous cases. `where party is null` on every
+# branch is the guardrail: a human/agent-curated party is never touched.
+cur.execute(r"""
+    update candidates set party = 'X', party_source = 'non-candidate', updated_at = now()
+    where party is null
+      and name ~* '^(other|undecided|someone else|not sure|neither|none|refused|don''t know|would not vote|third party)'
+""")
+geo_steps.append(("candidates auto-classified (non-candidate -> X)", cur.rowcount))
+
+cur.execute(r"""
+    update candidates set party = 'D', party_source = 'literal-label', updated_at = now()
+    where party is null and name ~* '^(dem|democrat|democratic)$'
+""")
+geo_steps.append(("candidates auto-classified (literal label -> D)", cur.rowcount))
+
+cur.execute(r"""
+    update candidates set party = 'R', party_source = 'literal-label', updated_at = now()
+    where party is null and name ~* '^(rep|republican|gop)$'
+""")
+geo_steps.append(("candidates auto-classified (literal label -> R)", cur.rowcount))
+
+# 8. race_averages: fully recomputed by the DB function every run. The
+# aggregation/weighting logic lives in Postgres (schema.sql); this is just
+# the call site.
+cur.execute("select refresh_race_averages(2026)")
+geo_steps.append(("race_averages rows upserted", cur.fetchone()[0]))
+
+conn.commit()
+
 # -------------------------------------------------------------------- verify
 cur.execute("select count(*) from polls"); n_polls = cur.fetchone()[0]
 cur.execute("select count(*) from pollsters"); n_pollsters = cur.fetchone()[0]
@@ -236,3 +350,6 @@ print(f"generic ballot avg: {len(gb_series)} days" + (f", latest {gb_series[-1]}
 print("top pollsters:")
 for name, n in top:
     print(f"  {name:30s} {n}")
+print("geography / candidates / race_averages:")
+for label, n in geo_steps:
+    print(f"  {label:45s} {n}")

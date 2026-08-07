@@ -1,21 +1,38 @@
 import { supabase } from "../lib/supabase";
+import type { RaceAverage } from "../lib/supabase";
+import StateMap from "./StateMap";
 
 export const revalidate = 3600; // static-ish; ETL runs on its own schedule, page rebuilds hourly
 
 async function getData() {
-  const [{ data: series }, { data: pollsters }, { count: pollCount }, { count: pollsterCount }] =
-    await Promise.all([
-      supabase.from("generic_ballot_average").select("*").order("date"),
-      supabase.from("pollsters").select("*").not("fte_numeric_grade", "is", null)
-        .order("fte_polls_analyzed", { ascending: false }).limit(15),
-      supabase.from("polls").select("*", { count: "exact", head: true }),
-      supabase.from("pollsters").select("*", { count: "exact", head: true }),
-    ]);
-  return { series: series ?? [], pollsters: pollsters ?? [], pollCount, pollsterCount };
+  const [
+    { data: series },
+    { data: pollsters },
+    { count: pollCount },
+    { count: pollsterCount },
+    { data: races },
+  ] = await Promise.all([
+    supabase.from("generic_ballot_average").select("*").order("date"),
+    supabase.from("pollsters").select("*").not("fte_numeric_grade", "is", null)
+      .order("fte_polls_analyzed", { ascending: false }).limit(15),
+    supabase.from("polls").select("*", { count: "exact", head: true }),
+    supabase.from("pollsters").select("*", { count: "exact", head: true }),
+    // One query for both offices; the map component splits/toggles in memory.
+    supabase.from("race_averages").select("*").eq("cycle", 2026).order("state"),
+  ]);
+  const all = (races ?? []) as RaceAverage[];
+  return {
+    series: series ?? [],
+    pollsters: pollsters ?? [],
+    pollCount,
+    pollsterCount,
+    senate: all.filter((r) => r.office === "senate"),
+    governor: all.filter((r) => r.office === "governor"),
+  };
 }
 
 export default async function Page() {
-  const { series, pollsters, pollCount, pollsterCount } = await getData();
+  const { series, pollsters, pollCount, pollsterCount, senate, governor } = await getData();
   const last = series[series.length - 1];
 
   return (
@@ -26,6 +43,8 @@ export default async function Page() {
            deployed on Vercel, built on CC BY 4.0 sources.</p>
       </header>
 
+      <StateMap senate={senate} governor={governor} />
+
       <div className="tiles">
         <div className="tile"><div className="k">Polls</div><div className="v">{pollCount?.toLocaleString()}</div></div>
         <div className="tile"><div className="k">Pollsters</div><div className="v">{pollsterCount}</div></div>
@@ -35,7 +54,7 @@ export default async function Page() {
       {last && (
         <div className="card">
           <h2>Generic congressional ballot</h2>
-          <div className="hero" style={{ color: "var(--dem)" }}>
+          <div className="hero" style={{ color: last.margin > 0 ? "var(--dem)" : "var(--rep)" }}>
             {last.margin > 0 ? "D" : "R"}+{Math.abs(last.margin)}
           </div>
           <p className="note">{last.dem}% Dem · {last.rep}% Rep · as of {last.date} · {last.polls_in_window} polls in window</p>
@@ -57,7 +76,8 @@ export default async function Page() {
 
       <style>{`
         :root { --surface-0:#f6f5f2; --surface-1:#fcfcfb; --line:#e3e1db;
-          --text-primary:#0b0b0b; --text-secondary:#52514e; --dem:#2a78d6; }
+          --text-primary:#0b0b0b; --text-secondary:#52514e;
+          --dem:#2a78d6; --rep:#e34948; }
         body { background:var(--surface-0); color:var(--text-primary);
           font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif; }
         .wrap { max-width:900px; margin:0 auto; padding:40px 20px; }

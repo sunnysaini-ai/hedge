@@ -34,6 +34,21 @@ export type Pollster = {
   fte_transparency: number | null;
 };
 
+export type RaceAverage = {
+  state: string; // 2-letter postal code
+  office: "senate" | "governor";
+  cycle: number;
+  dem_candidate: string | null;
+  rep_candidate: string | null;
+  dem_pct: number;
+  rep_pct: number;
+  margin: number; // dem minus rep
+  leader_party: "D" | "R" | null;
+  polls_used: number;
+  latest_poll: string | null;
+  low_data: boolean;
+};
+
 export type GenericBallotDay = {
   date: string;
   dem: number;
