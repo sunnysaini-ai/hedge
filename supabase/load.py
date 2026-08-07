@@ -327,6 +327,11 @@ geo_steps.append(("candidates auto-classified (literal label -> R)", cur.rowcoun
 cur.execute("select refresh_race_averages(2026)")
 geo_steps.append(("race_averages rows upserted", cur.fetchone()[0]))
 
+# 9. approval_averages: fully recomputed by the DB function every run, same
+# pattern as race_averages above — logic lives in Postgres, this is the call site.
+cur.execute("select refresh_approval_averages();")
+geo_steps.append(("approval_averages rows upserted", cur.fetchone()[0]))
+
 conn.commit()
 
 # -------------------------------------------------------------------- verify

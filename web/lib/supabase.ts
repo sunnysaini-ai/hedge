@@ -56,3 +56,12 @@ export type GenericBallotDay = {
   margin: number;
   polls_in_window: number;
 };
+
+export type ApprovalDay = {
+  subject: string; // "Donald Trump" | "Congress" | "Supreme Court" | "JD Vance"
+  date: string; // YYYY-MM-DD
+  approve_pct: number;
+  disapprove_pct: number;
+  net: number; // approve minus disapprove
+  polls_in_window: number;
+};

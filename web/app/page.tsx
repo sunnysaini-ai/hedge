@@ -1,8 +1,30 @@
 import { supabase } from "../lib/supabase";
-import type { RaceAverage } from "../lib/supabase";
+import type { ApprovalDay, RaceAverage } from "../lib/supabase";
 import StateMap from "./StateMap";
+import ApprovalTracker from "./ApprovalTracker";
 
 export const revalidate = 3600; // static-ish; ETL runs on its own schedule, page rebuilds hourly
+
+// All subjects at once from the precomputed daily-averages table (never the
+// raw polls). ~5.8K small rows, but PostgREST caps each response at 1,000
+// rows, so page through with .range(). Secondary sort on subject keeps the
+// pagination deterministic (multiple subjects share each date).
+async function getApproval(): Promise<ApprovalDay[]> {
+  const PAGE = 1000;
+  const rows: ApprovalDay[] = [];
+  for (let from = 0; ; from += PAGE) {
+    const { data } = await supabase
+      .from("approval_averages")
+      .select("subject,date,approve_pct,disapprove_pct,net,polls_in_window")
+      .order("date")
+      .order("subject")
+      .range(from, from + PAGE - 1);
+    const page = (data ?? []) as ApprovalDay[];
+    rows.push(...page);
+    if (page.length < PAGE) break;
+  }
+  return rows;
+}
 
 async function getData() {
   const [
@@ -11,6 +33,7 @@ async function getData() {
     { count: pollCount },
     { count: pollsterCount },
     { data: races },
+    approvalRows,
   ] = await Promise.all([
     supabase.from("generic_ballot_average").select("*").order("date"),
     supabase.from("pollsters").select("*").not("fte_numeric_grade", "is", null)
@@ -19,8 +42,11 @@ async function getData() {
     supabase.from("pollsters").select("*", { count: "exact", head: true }),
     // One query for both offices; the map component splits/toggles in memory.
     supabase.from("race_averages").select("*").eq("cycle", 2026).order("state"),
+    getApproval(),
   ]);
   const all = (races ?? []) as RaceAverage[];
+  const approval: Record<string, ApprovalDay[]> = {};
+  for (const row of approvalRows) (approval[row.subject] ??= []).push(row);
   return {
     series: series ?? [],
     pollsters: pollsters ?? [],
@@ -28,11 +54,12 @@ async function getData() {
     pollsterCount,
     senate: all.filter((r) => r.office === "senate"),
     governor: all.filter((r) => r.office === "governor"),
+    approval,
   };
 }
 
 export default async function Page() {
-  const { series, pollsters, pollCount, pollsterCount, senate, governor } = await getData();
+  const { series, pollsters, pollCount, pollsterCount, senate, governor, approval } = await getData();
   const last = series[series.length - 1];
 
   return (
@@ -44,6 +71,8 @@ export default async function Page() {
       </header>
 
       <StateMap senate={senate} governor={governor} />
+
+      <ApprovalTracker series={approval} />
 
       <div className="tiles">
         <div className="tile"><div className="k">Polls</div><div className="v">{pollCount?.toLocaleString()}</div></div>
@@ -77,7 +106,8 @@ export default async function Page() {
       <style>{`
         :root { --surface-0:#f6f5f2; --surface-1:#fcfcfb; --line:#e3e1db;
           --text-primary:#0b0b0b; --text-secondary:#52514e;
-          --dem:#2a78d6; --rep:#e34948; }
+          --dem:#2a78d6; --rep:#e34948;
+          --approve:#1baf7a; --disapprove:#e0793c; }
         body { background:var(--surface-0); color:var(--text-primary);
           font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif; }
         .wrap { max-width:900px; margin:0 auto; padding:40px 20px; }
