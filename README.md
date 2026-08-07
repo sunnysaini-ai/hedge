@@ -112,3 +112,21 @@ VoteHub's fault — every poll database has them. Publishing them is the point.
 
 See `OpenPolls-Strategy-Report.md` for the full landscape research, legal
 position, and governance/credibility plan.
+
+## Known temporary debt (Aug 2026, to resolve when GitHub push is unblocked)
+
+The Vercel project's **Build Command** is currently overridden in the
+dashboard to `node scripts/gen-usmap.mjs && next build`, done as a one-time
+workaround to deploy `lib/usmap.gen.ts` (a 110KB generated file) directly to
+Vercel while the sandbox's GitHub push was blocked. Git already has the
+correct frozen `lib/usmap.gen.ts` committed — regenerating at build time is
+redundant, not required.
+
+**Fix, in order, once `git push` works again:**
+1. Push the local `main` branch (already committed, just blocked from leaving
+   the sandbox).
+2. Revert the Vercel project's Build Command to default (`next build`) in
+   Settings -> Build and Deployment, so the deploy path matches what's
+   declared in the repo again.
+Do NOT do step 2 before step 1 — it will break the map (nothing would
+generate the file).
