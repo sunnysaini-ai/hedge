@@ -463,6 +463,353 @@ begin
 end;
 $function$;
 
+-- ------------------------------------------------- generic ballot averages
+-- The generic-ballot series used to be computed in Python (supabase/load.py)
+-- and merely stored here. It now lives in the database, like race_averages and
+-- approval_averages, for one reason: a published number must not depend on
+-- which revision of the ETL happened to run. The scheduled ingest runs from a
+-- checkout we cannot always keep current, and when that checkout was stale it
+-- (a) extrapolated the series past the last real poll and (b) never ran the
+-- post-ingest backfills at all, so new polls sat in `polls` without ever
+-- reaching a published average. Both failures are now the database's problem,
+-- and the database fixes them on a schedule.
+--
+-- Semantics below are a faithful port of load.py's gb loop, verified against it
+-- on live data: over all 535 overlapping dates the two implementations agree
+-- exactly (max |delta| 0.00 on dem, rep and margin; identical polls_in_window).
+--   qualifying poll = poll_type 'generic-ballot', NOT partisan, NOT internal,
+--                     start_date <= end_date, and has BOTH a 'Dem' and a 'Rep'
+--                     answer row
+--   weight = 0.5^(age_days/30) * sqrt(min(n,3000)/1000) * quality_weight
+--   quality_weight = 0.6 + 0.4*(538 numeric grade / 3) when the poll's registry
+--                    pollster is graded, else 0.8
+--   window = 0 <= age_days <= 120; a day is published only at >= 3 polls
+--   series = (earliest qualifying end_date + 20 days) .. LAST qualifying end_date
+--
+-- The arithmetic is deliberately done in double precision rather than numeric:
+-- Python computes these in float64, and matching its arithmetic is what keeps
+-- the two implementations from disagreeing at a rounding boundary.
+
+-- The honest-end bound (methodology decision 2026-08-07: the series hard-stops
+-- at the end_date of the most recent real generic-ballot poll and does NOT run
+-- forward to the run date -- see the long note in supabase/load.py for why).
+-- Factored into its own function so the refresh and the guard trigger below can
+-- never disagree about where the series is allowed to stop.
+create or replace function gb_hard_stop()
+ returns date
+ language sql
+ stable security definer
+ set search_path to 'public'
+as $function$
+  select max(p.end_date)
+  from polls p
+  where p.poll_type = 'generic-ballot'
+    and coalesce(p.partisan, '') = ''
+    and not coalesce(p.internal, false)
+    and not (p.start_date is not null and p.start_date > p.end_date)
+    and exists (select 1 from poll_answers a where a.poll_id = p.id and a.choice = 'Dem')
+    and exists (select 1 from poll_answers a where a.poll_id = p.id and a.choice = 'Rep');
+$function$;
+
+-- Fully recomputes generic_ballot_average and removes any row past the hard
+-- stop -- so a run also cleans up a synthetic tail left by some other writer.
+create or replace function refresh_generic_ballot()
+ returns jsonb
+ language plpgsql
+ security definer
+ set search_path to 'public'
+as $function$
+declare
+  n_upserted int := 0;
+  n_deleted  int := 0;
+  v_first    date;
+  v_last     date;
+  v_polls    int := 0;
+begin
+  v_last := gb_hard_stop();
+
+  select min(p.end_date), count(*)
+    into v_first, v_polls
+  from polls p
+  where p.poll_type = 'generic-ballot'
+    and coalesce(p.partisan, '') = ''
+    and not coalesce(p.internal, false)
+    and not (p.start_date is not null and p.start_date > p.end_date)
+    and exists (select 1 from poll_answers a where a.poll_id = p.id and a.choice = 'Dem')
+    and exists (select 1 from poll_answers a where a.poll_id = p.id and a.choice = 'Rep');
+
+  if v_last is not null then
+    with gbp as (
+      -- one row per qualifying poll, pre-weighted
+      select p.end_date,
+             -- `sample_size or 600` in Python: 0 and null both fall back to 600
+             least(coalesce(nullif(p.sample_size, 0), 600), 3000)::double precision as n_eff,
+             ad.pct::double precision as dem,
+             ar.pct::double precision as rep,
+             -- `if g` in Python: an ungraded OR zero-graded pollster gets 0.8
+             case when ps.fte_numeric_grade is not null and ps.fte_numeric_grade <> 0
+                  then 0.6::double precision
+                       + 0.4::double precision * (ps.fte_numeric_grade::double precision / 3.0::double precision)
+                  else 0.8::double precision
+             end as qw
+      from polls p
+      join poll_answers ad on ad.poll_id = p.id and ad.choice = 'Dem'
+      join poll_answers ar on ar.poll_id = p.id and ar.choice = 'Rep'
+      left join pollsters ps on ps.id = p.pollster_id
+      where p.poll_type = 'generic-ballot'
+        and coalesce(p.partisan, '') = ''
+        and not coalesce(p.internal, false)
+        and not (p.start_date is not null and p.start_date > p.end_date)
+    ),
+    days as (
+      select d::date as date
+      from generate_series(v_first + 20, v_last, interval '1 day') d
+    ),
+    scored as (
+      select dd.date, g.dem, g.rep,
+             power(0.5::double precision,
+                   (dd.date - g.end_date)::double precision / 30.0::double precision)
+               * sqrt(g.n_eff / 1000.0::double precision)
+               * g.qw as w
+      from days dd
+      join gbp g on g.end_date <= dd.date and (dd.date - g.end_date) <= 120
+    ),
+    agg as (
+      select date, sum(w * dem) as nd, sum(w * rep) as nr, sum(w) as den, count(*)::int as used
+      from scored group by 1
+    ),
+    upserted as (
+      insert into generic_ballot_average (date, dem, rep, margin, polls_in_window, computed_at)
+      select date,
+             round((nd / den)::numeric, 2),
+             round((nr / den)::numeric, 2),
+             -- margin is the difference of the UNROUNDED means, as in load.py
+             round((nd / den - nr / den)::numeric, 2),
+             used, now()
+      from agg
+      where den > 0 and used >= 3
+      on conflict (date) do update set
+        dem = excluded.dem, rep = excluded.rep, margin = excluded.margin,
+        polls_in_window = excluded.polls_in_window, computed_at = now()
+      returning 1
+    )
+    select count(*)::int into n_upserted from upserted;
+
+    -- The self-defending half: anything dated past the last real poll is a
+    -- synthetic tail no matter who wrote it, so drop it every run. Rows BEFORE
+    -- the series start are deliberately left alone -- ingest is append-only, so
+    -- an earlier poll can only extend the series backwards, never orphan a row.
+    delete from generic_ballot_average where date > v_last;
+    get diagnostics n_deleted = row_count;
+  end if;
+
+  return jsonb_build_object(
+    'qualifying_polls', v_polls,
+    'series_start',     case when v_first is null then null else v_first + 20 end,
+    'series_end',       v_last,
+    'rows_upserted',    n_upserted,
+    'tail_rows_deleted', n_deleted
+  );
+end;
+$function$;
+
+-- --------------------------------------- generic ballot: synthetic-tail guard
+-- Refusing the bad row at the table is what makes the end-bound a property of
+-- the data rather than a property of whichever loader ran. It skips silently
+-- (return null) instead of raising, on purpose: raising would abort the whole
+-- ETL upsert and turn a cosmetic over-reach into a failed ingest, whereas
+-- skipping lets a stale job finish successfully while simply not getting its
+-- invented rows. Rows written by refresh_generic_ballot() always pass, since
+-- that function never generates a date past gb_hard_stop().
+--
+-- Cost: one gb_hard_stop() lookup per row (~5 ms). At the current series length
+-- (~535 rows per full upsert) that is a few seconds per run, twice a day. If
+-- the series or the polls table grows by an order of magnitude, revisit.
+create or replace function generic_ballot_average_guard()
+ returns trigger
+ language plpgsql
+ security definer
+ set search_path to 'public'
+as $function$
+declare
+  v_stop date;
+begin
+  v_stop := gb_hard_stop();
+  -- Null bound = no qualifying polls at all; nothing to measure against, so
+  -- don't block (fail open rather than silently swallowing every write).
+  if v_stop is not null and new.date > v_stop then
+    return null;  -- silently skip: no synthetic tail, no failed ETL run
+  end if;
+  return new;
+end;
+$function$;
+
+drop trigger if exists generic_ballot_average_no_synthetic_tail on generic_ballot_average;
+create trigger generic_ballot_average_no_synthetic_tail
+  before insert or update on generic_ballot_average
+  for each row execute function generic_ballot_average_guard();
+
+-- --------------------------------------------------------- post-ingest pass
+-- Everything supabase/load.py does AFTER the raw polls/poll_answers upsert,
+-- moved into the database so it happens whether or not the loader that ran
+-- knows about it. Every statement is either a `where <col> is null` backfill or
+-- an `on conflict do nothing` seed, so running this against an unchanged
+-- database touches 0 rows and is safe on any schedule.
+--
+-- THE RULE THAT MUST NOT BE BROKEN: never overwrite a non-null
+-- candidates.party. That column is a human/agent-curated registry, not ETL
+-- output. Every auto-classify branch below keeps its `where party is null`
+-- guard for exactly that reason.
+create or replace function run_post_ingest()
+ returns jsonb
+ language plpgsql
+ security definer
+ set search_path to 'public'
+as $function$
+declare
+  steps jsonb := '[]'::jsonb;
+  n     int;
+  gb    jsonb;
+  t0    timestamptz := clock_timestamp();
+begin
+  -- 1. cycle: leading 4-digit year in `subject`, e.g. '2026 Texas' -> 2026.
+  update polls set cycle = substring(subject from '^(\d{4})')::int
+  where subject ~ '^\d{4}' and cycle is null;
+  get diagnostics n = row_count;
+  steps := steps || jsonb_build_array(jsonb_build_object('step', '1 polls.cycle backfilled', 'rows', n));
+
+  -- 2. office: derived straight from poll_type.
+  update polls set office = case poll_type
+      when 'us-senator'        then 'senate'
+      when 'governor'          then 'governor'
+      when 'us-representative' then 'house'
+      when 'attorney-general'  then 'attorney-general'
+      when 'mayor'             then 'mayor'
+  end
+  where office is null
+    and poll_type in ('us-senator', 'governor', 'us-representative',
+                      'attorney-general', 'mayor');
+  get diagnostics n = row_count;
+  steps := steps || jsonb_build_array(jsonb_build_object('step', '2 polls.office backfilled', 'rows', n));
+
+  -- 3. race_class: subject ending in a bare party name (optionally + "Primary")
+  -- is a primary; so is any presidential-primary poll_type; everything else
+  -- still gets a value ('general') so this column is never left ambiguous.
+  update polls set race_class = case
+      when subject ~ '\m(Democratic|Republican|Dem|GOP)\s*(Primary)?\s*$' then 'primary'
+      when poll_type = 'presidential-primary' then 'primary'
+      else 'general'
+  end
+  where race_class is null;
+  get diagnostics n = row_count;
+  steps := steps || jsonb_build_array(jsonb_build_object('step', '3 polls.race_class backfilled', 'rows', n));
+
+  -- 4. district rows: subject like '2026 AK-01' -> state 'AK', district 'AK-01'.
+  -- Runs before the statewide step below so those rows are already spoken for.
+  update polls set
+      state    = substring(subject from '^\d{4}\s+([A-Z]{2})-'),
+      district = substring(subject from '^\d{4}\s+([A-Z]{2}-\S+)')
+  where subject ~ '^\d{4}\s+[A-Z]{2}-' and state is null;
+  get diagnostics n = row_count;
+  steps := steps || jsonb_build_array(jsonb_build_object('step', '4 polls.state/district (house) backfilled', 'rows', n));
+
+  -- 5. statewide rows: match subject against us_states.name, longest name first
+  -- so a New Hampshire poll can never resolve to 'Hampshire' and a West Virginia
+  -- poll never resolves to 'Virginia'.
+  update polls p
+  set state = (
+      select s.code
+      from us_states s
+      where position(s.name in p.subject) > 0
+      order by length(s.name) desc
+      limit 1
+  )
+  where p.state is null and p.subject is not null
+    and exists (select 1 from us_states s2 where position(s2.name in p.subject) > 0);
+  get diagnostics n = row_count;
+  steps := steps || jsonb_build_array(jsonb_build_object('step', '5 polls.state (statewide) backfilled', 'rows', n));
+
+  -- 6. seed candidates: one identity row per distinct answer choice seen in a
+  -- 2026 general senate/governor poll. party/party_source are left null here --
+  -- this step only registers *who exists*, never *what party they are*.
+  insert into candidates (state, office, cycle, name)
+  select distinct p.state, p.office, p.cycle, pa.choice
+  from polls p
+  join poll_answers pa on pa.poll_id = p.id
+  where p.cycle = 2026 and p.race_class = 'general'
+    and p.office in ('senate', 'governor') and p.state is not null
+  on conflict (state, office, cycle, name) do nothing;
+  get diagnostics n = row_count;
+  steps := steps || jsonb_build_array(jsonb_build_object('step', '6 candidates seeded', 'rows', n));
+
+  -- 7. auto-classify ONLY the unambiguous cases. `where party is null` on every
+  -- branch is the guardrail: a human/agent-curated party is never touched.
+  update candidates set party = 'X', party_source = 'non-candidate', updated_at = now()
+  where party is null
+    and name ~* '^(other|undecided|someone else|not sure|neither|none|refused|don''t know|would not vote|third party)';
+  get diagnostics n = row_count;
+  steps := steps || jsonb_build_array(jsonb_build_object('step', '7a candidates auto-classified (non-candidate -> X)', 'rows', n));
+
+  update candidates set party = 'D', party_source = 'literal-label', updated_at = now()
+  where party is null and name ~* '^(dem|democrat|democratic)$';
+  get diagnostics n = row_count;
+  steps := steps || jsonb_build_array(jsonb_build_object('step', '7b candidates auto-classified (literal label -> D)', 'rows', n));
+
+  update candidates set party = 'R', party_source = 'literal-label', updated_at = now()
+  where party is null and name ~* '^(rep|republican|gop)$';
+  get diagnostics n = row_count;
+  steps := steps || jsonb_build_array(jsonb_build_object('step', '7c candidates auto-classified (literal label -> R)', 'rows', n));
+
+  -- 8/9/10. the three derived series, each a full idempotent recompute.
+  select refresh_race_averages(2026) into n;
+  steps := steps || jsonb_build_array(jsonb_build_object('step', '8 race_averages rows upserted', 'rows', n));
+
+  select refresh_approval_averages() into n;
+  steps := steps || jsonb_build_array(jsonb_build_object('step', '9 approval_averages rows upserted', 'rows', n));
+
+  select refresh_generic_ballot() into gb;
+  steps := steps || jsonb_build_array(jsonb_build_object('step', '10 generic_ballot_average recomputed', 'rows', gb));
+
+  return jsonb_build_object(
+    'ran_at',  now(),
+    'elapsed', round(extract(epoch from clock_timestamp() - t0)::numeric, 3),
+    'steps',   steps
+  );
+end;
+$function$;
+
+-- ------------------------------------------------------- function lockdown
+-- Same posture as refresh_race_averages/refresh_approval_averages: these are
+-- server-side maintenance entry points, never reachable with the anon key.
+-- Resulting ACL on each is {postgres=X/postgres,service_role=X/postgres}.
+revoke all on function gb_hard_stop()                 from public, anon, authenticated;
+revoke all on function refresh_generic_ballot()       from public, anon, authenticated;
+revoke all on function generic_ballot_average_guard() from public, anon, authenticated;
+revoke all on function run_post_ingest()              from public, anon, authenticated;
+grant execute on function gb_hard_stop()                 to postgres, service_role;
+grant execute on function refresh_generic_ballot()       to postgres, service_role;
+grant execute on function generic_ballot_average_guard() to postgres, service_role;
+grant execute on function run_post_ingest()              to postgres, service_role;
+
+-- ---------------------------------------------------------------- schedule
+-- GitHub Actions ingests raw polls every 6h at :17 and takes 3-5 minutes. The
+-- database runs its own post-ingest pass at :45 -- ~28 minutes of buffer -- so
+-- it always sees a finished load, and re-normalises the generic ballot after
+-- any writer (including a stale ETL) has had its turn.
+--
+-- cron.schedule(name, schedule, command) is an upsert on the job name, so
+-- re-applying this file re-points the existing job rather than duplicating it.
+-- The job runs as `postgres` in the `postgres` database (cron.database_name).
+-- Inspect with:  select * from cron.job;
+--                select * from cron.job_run_details order by start_time desc limit 10;
+create extension if not exists pg_cron;
+
+select cron.schedule(
+  'hedge_post_ingest',
+  '45 */6 * * *',
+  $job$select public.run_post_ingest();$job$
+);
+
 comment on table pollsters is 'Hand-curated pollster registry with stable IDs. The durable asset in this whole project.';
 comment on table polls is 'One row per rated question. source_url/source_org/source_license/retrieved_at make every row auditable.';
 comment on table data_quality_findings is 'Published defect list. A commons that hides its own errors is not a commons.';
@@ -475,3 +822,7 @@ comment on table race_averages is 'One row per competitive (state, office, cycle
 comment on column race_averages.matchup_source is '''nominees'' = the D/R pair came from the curated race_nominees table (primary decided, both nominees verified, and at least one poll asked about that exact pair). ''co-polling'' = pre-primary fallback, the most-frequently-co-polled D/R pair among party-resolved candidates.';
 comment on column race_averages.avg_grade is 'Weight-weighted mean of pollsters.fte_numeric_grade (538 scale, ~0-3) over exactly the polls used in this race average, using the same weights as the average itself. Graded polls only. Null when fewer than half the polls used have a grade, so a thin graded subset never stands in for the whole average.';
 comment on table approval_averages is 'One row per (subject, date) approval average. Fully recomputed by refresh_approval_averages() every ETL run.';
+comment on function gb_hard_stop() is 'End-bound of generic_ballot_average: the end_date of the most recent real qualifying generic-ballot poll. Single source of truth shared by refresh_generic_ballot() and the generic_ballot_average guard trigger. Null when no qualifying poll exists.';
+comment on function refresh_generic_ballot() is 'Fully recomputes generic_ballot_average from polls/poll_answers/pollsters using the same weighting as supabase/load.py, hard-stopping at gb_hard_stop(), and deletes any row past that bound. Idempotent full recompute, same contract as refresh_race_averages()/refresh_approval_averages().';
+comment on function generic_ballot_average_guard() is 'BEFORE INSERT OR UPDATE guard on generic_ballot_average: silently drops any row dated past gb_hard_stop(). Blocks synthetic tails from ANY writer, including a stale ETL, without failing that writer''s run.';
+comment on function run_post_ingest() is 'Idempotent post-ingest pass: the geography/candidate backfills from supabase/load.py plus refresh_race_averages(2026), refresh_approval_averages() and refresh_generic_ballot(). Safe to run on any schedule; touches 0 rows when nothing new has landed. Never overwrites a non-null candidates.party.';
