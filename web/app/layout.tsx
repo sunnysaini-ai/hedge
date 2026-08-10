@@ -3,6 +3,7 @@ import type { Metadata } from "next";
 const DESCRIPTION = "Free, open, auditable US polling averages — no forecasts.";
 
 export const metadata: Metadata = {
+  metadataBase: new URL("https://choosehedge.com"),
   title: {
     default: "Hedge — US polling averages",
     template: "%s — Hedge",
