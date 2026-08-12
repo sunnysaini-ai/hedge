@@ -7,6 +7,7 @@ Stack: **Supabase (Postgres) + Vercel (Next.js)** + **GitHub Actions** for
 the scheduled ETL. Chosen to match tooling already in use on DealDesk, so
 there's nothing new to learn to start shipping.
 
+
 ## Repo layout
 
 ```
