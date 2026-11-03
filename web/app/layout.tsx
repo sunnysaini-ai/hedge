@@ -30,6 +30,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <div className="sitehead-inner">
             <a href="/" className="sitehead-brand">Hedge</a>
             <nav className="sitehead-nav">
+              <a href="/election-day" className="sitehead-live">Election night</a>
               <a href="/pollsters">Pollsters</a>
               <a href="/methodology">Methodology</a>
               <a href="/about">About</a>
@@ -54,6 +55,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           .sitehead-nav { display:flex; gap:18px; flex-wrap:wrap; }
           .sitehead-nav a { color:var(--text-secondary); text-decoration:none; font-size:.84rem; }
           .sitehead-nav a:hover { color:var(--text-primary); text-decoration:underline; }
+          .sitehead-nav a.sitehead-live { color:var(--text-primary); font-weight:600; }
         `}</style>
       </body>
     </html>

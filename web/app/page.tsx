@@ -71,6 +71,11 @@ export default async function Page() {
            deployed on Vercel, built on CC BY 4.0 sources.</p>
       </header>
 
+      <a className="edbanner" href="/election-day">
+        <span className="edbanner-k">Election Day · Nov 3</span>
+        <span className="edbanner-t">Poll closings, final averages and official results links, state by state →</span>
+      </a>
+
       <StateMap senate={senate} governor={governor} />
 
       <KeyRaces senate={senate} governor={governor} />
@@ -116,6 +121,12 @@ export default async function Page() {
         th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
         .n { text-align:right; }
         .note { color:var(--text-secondary); }
+        .edbanner { display:flex; gap:4px 12px; flex-wrap:wrap; align-items:baseline; margin-top:16px;
+          padding:12px 16px; border-radius:12px; border:1px solid var(--text-primary);
+          background:var(--surface-1); color:var(--text-primary); text-decoration:none; }
+        .edbanner:hover { background:var(--surface-0); }
+        .edbanner-k { font-size:.72rem; font-weight:700; text-transform:uppercase; letter-spacing:.05em; }
+        .edbanner-t { font-size:.9rem; }
       `}</style>
     </main>
   );
