@@ -2,22 +2,28 @@ import type { Metadata } from "next";
 import { supabase } from "../../lib/supabase";
 import type { GenericBallotDay, RaceAverage } from "../../lib/supabase";
 import { formatGrade } from "../grades";
-import { NightClock, WaveStatus } from "./Clock";
+import { AutoRefresh, NightClock, WaveStatus } from "./Clock";
+import CountMap, { statusFor } from "./CountMap";
+import { COUNTED_STATES, FEED_META, getOfficialCounts } from "./feeds";
+import type { RaceCount, StateCount } from "./feeds";
 import type { ClosingEvent } from "./Clock";
 import { ELECTION_OFFICE, FIRST_CLOSE, STATE_NAMES, WAVES } from "./schedule";
 
-// Election night page, Nov 3 2026. Reads the same race_averages rows as the
-// homepage — no new queries, no new tables — and lays them out along the
-// poll-closing timeline. Deliberately contains NO vote counts and NO calls:
-// Hedge is a polling database, so results are linked out to each state's
-// official election office.
+// Election night page, Nov 3 2026. Hedge's final polling averages laid out
+// along the poll-closing timeline, a neutral live map, and — for states whose
+// election office publishes an official machine-readable results file — the
+// official count so far (feeds.ts). Hedge never calls races: no projections,
+// no "leading" labels, candidates in fixed party order.
+//
+// Rendered per request so the map and counts are current; the state files
+// themselves are fetched at most once a minute (cached in feeds.ts).
 
-export const revalidate = 3600;
+export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: "Election night tracker",
   description:
-    "Poll-closing times for Nov 3, 2026, Hedge's final polling averages for every Senate and governor race, and links to official results.",
+    "Live poll closings, official vote counts where states publish them, Hedge's final polling averages, and links to official results. No race calls.",
 };
 
 const DEM = "#2a78d6";
@@ -73,14 +79,53 @@ function clean(r: RaceAverage): RaceAverage {
 }
 
 async function getData() {
-  const [{ data: races }, { data: gb }] = await Promise.all([
+  const [{ data: races }, { data: gb }, counts] = await Promise.all([
     supabase.from("race_averages").select("*").eq("cycle", 2026).order("state"),
     supabase.from("generic_ballot_average").select("*").order("date", { ascending: false }).limit(1),
+    getOfficialCounts().catch(() => [] as StateCount[]),
   ]);
   return {
     races: ((races ?? []) as RaceAverage[]).map(clean),
     generic: ((gb ?? []) as GenericBallotDay[])[0] ?? null,
+    counts,
   };
+}
+
+function fmtTime(iso: string | null) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  const et = d.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+  const pt = d.toLocaleTimeString("en-US", { timeZone: "America/Los_Angeles", hour: "numeric", minute: "2-digit" });
+  return `${et} ET / ${pt} PT`;
+}
+
+function OfficialRace({ race }: { race: RaceCount }) {
+  const pct = race.precinctsTotal ? (race.precinctsReporting / race.precinctsTotal) * 100 : 0;
+  return (
+    <div className="oc-race">
+      <div className="oc-race-head">
+        <span className="oc-office">{OFFICE_LABEL[race.office]}</span>
+        <span className="oc-prog">
+          <span className="oc-bar"><span style={{ width: `${Math.min(100, pct)}%` }} /></span>
+          {race.precinctsReporting.toLocaleString()} of {race.precinctsTotal.toLocaleString()} precincts reporting
+          {" "}({pct.toFixed(pct > 0 && pct < 1 ? 1 : 0)}%)
+        </span>
+      </div>
+      <div className="oc-total">{race.totalVotes.toLocaleString()} votes counted</div>
+      <table className="oc-tbl">
+        <tbody>
+          {race.candidates.filter((c) => c.party !== "O" || c.votes > 0 || race.totalVotes === 0).map((c) => (
+            <tr key={`${c.name}-${c.partyLabel}`}>
+              <td className={c.party === "D" ? "rr-d" : c.party === "R" ? "rr-r" : ""}>{c.name}</td>
+              <td className="oc-pty">{c.partyLabel}</td>
+              <td className="n">{c.votes.toLocaleString()}</td>
+              <td className="n oc-share">{race.totalVotes ? `${((c.votes / race.totalVotes) * 100).toFixed(1)}%` : "—"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 const WAVE_OF: Record<string, (typeof WAVES)[number]> = {};
@@ -129,7 +174,9 @@ function RaceRow({ r, showState }: { r: RaceAverage; showState?: boolean }) {
 }
 
 export default async function ElectionDayPage() {
-  const { races, generic } = await getData();
+  const { races, generic, counts } = await getData();
+  const now = Date.now();
+  const countsByState = new Map(counts.map((c) => [c.state, c]));
 
   const byState: Record<string, RaceAverage[]> = {};
   for (const r of races) (byState[r.state] ??= []).push(r);
@@ -169,13 +216,59 @@ export default async function ElectionDayPage() {
         <div className="ed-kicker">Election Day · Tuesday, November 3, 2026</div>
         <h1 className="ed-h1">Election night tracker</h1>
         <p className="ed-lede">
-          When the polls close in each state, and where every Senate and governor race stood in Hedge's
-          final polling averages. Hedge is a polling database: we don't count votes or call races. For
-          results, each state below links to its official election office.
+          When the polls close, where the count stands, and where every Senate and governor race stood in
+          Hedge's final polling averages. Hedge never calls races. Vote counts shown here come straight
+          from state election offices that publish official results files; every other state links to its
+          office.
         </p>
       </header>
 
+      <AutoRefresh />
       <NightClock events={events} totalStates={totalStates} />
+
+      <section className="card">
+        <h2>Where the count stands</h2>
+        <p className="ed-sub">
+          Neutral colors only — this map shows counting progress, not who is ahead. Tap a state for its races.
+        </p>
+        <CountMap counts={counts} now={now} />
+
+        <h3 className="oc-h">Official counts so far</h3>
+        <p className="ed-sub">
+          Read directly from each state's official election-night results file, refreshed every minute.
+          Unofficial until certified. "Precincts reporting" is what states publish — it is not the share of
+          all votes counted, since mail and early ballots are tallied separately.
+        </p>
+        <div className="oc-grid">
+          {COUNTED_STATES.map((s) => {
+            const c = countsByState.get(s);
+            const meta = FEED_META[s];
+            const st = statusFor(s, now, countsByState);
+            return (
+              <div key={s} className="oc-card">
+                <div className="oc-head">
+                  <span className="oc-state">{STATE_NAMES[s]}</span>
+                  <span className="oc-status">{st.label}</span>
+                </div>
+                {!c || c.error ? (
+                  <p className="oc-err">
+                    The state's results file couldn't be read just now. Check{" "}
+                    <a href={meta.sourceUrl} target="_blank" rel="noopener noreferrer">{meta.sourceName}</a>.
+                  </p>
+                ) : (
+                  <>
+                    {c.races.map((r) => <OfficialRace key={r.office} race={r} />)}
+                    <p className="oc-src">
+                      Source: <a href={c.sourceUrl} target="_blank" rel="noopener noreferrer">{c.sourceName}</a>
+                      {" · "}file updated {fmtTime(c.fileUpdated)} · checked {fmtTime(c.fetchedAt)}
+                    </p>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </section>
 
       {watch.length > 0 && (
         <section className="card">
@@ -212,7 +305,7 @@ export default async function ElectionDayPage() {
               </div>
 
               {tracked.map((s) => (
-                <div key={s} className="st">
+                <div key={s} className="st" id={`st-${s}`}>
                   <div className="st-head">
                     <span className="st-name">{STATE_NAMES[s] ?? s}</span>
                     {FIRST_CLOSE[s] && <span className="st-note">first polls close {FIRST_CLOSE[s].et} ET</span>}
@@ -232,7 +325,7 @@ export default async function ElectionDayPage() {
                 <p className="wave-others">
                   {tracked.length > 0 ? "Also closing: " : "Closing: "}
                   {others.map((s, i) => (
-                    <span key={s}>
+                    <span key={s} id={`st-${s}`}>
                       {i > 0 && ", "}
                       {ELECTION_OFFICE[s] ? (
                         <a href={ELECTION_OFFICE[s]} target="_blank" rel="noopener noreferrer">{STATE_NAMES[s] ?? s}</a>
@@ -271,13 +364,15 @@ export default async function ElectionDayPage() {
           <li>Early returns can swing. States count mail, early and Election Day votes in different orders.</li>
           <li>Some races may go to a runoff or a ranked-choice count, so a winner may not be known tonight.</li>
           <li>All counts are unofficial until each state certifies its results.</li>
+          <li>Precincts reporting is not the same as votes counted: a precinct can report while mail ballots are still being tallied.</li>
         </ul>
         <p className="ed-src">
           Poll-closing times: <a href="https://www.270towin.com/poll-closing-times" target="_blank" rel="noopener noreferrer">270toWin</a>.
           Election office links: the{" "}
           <a href="https://www.fec.gov/introduction-campaign-finance/how-to-research-public-records/state-election-offices" target="_blank" rel="noopener noreferrer">
             FEC directory of state election offices
-          </a>. Averages: Hedge, see <a href="/methodology">methodology</a>.
+          </a>. Vote counts: official results files from the NC State Board of Elections, Florida Division of
+          Elections and Minnesota Secretary of State. Averages: Hedge, see <a href="/methodology">methodology</a>.
         </p>
       </section>
 
@@ -325,6 +420,26 @@ export default async function ElectionDayPage() {
         .wave-others a { color:var(--text-secondary); }
         .wave-nr { font-style:italic; }
 
+        .oc-h { margin:20px 0 0; font-size:1rem; }
+        .oc-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; margin-top:10px; }
+        .oc-card { border:1px solid var(--line); border-radius:10px; padding:12px 14px; background:var(--surface-0); }
+        .oc-head { display:flex; align-items:baseline; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+        .oc-state { font-weight:700; }
+        .oc-status { font-size:.74rem; color:var(--text-secondary); }
+        .oc-race { margin-top:10px; padding-top:8px; border-top:1px solid var(--line); }
+        .oc-race-head { display:flex; flex-direction:column; gap:3px; }
+        .oc-office { font-weight:600; font-size:.88rem; }
+        .oc-prog { font-size:.76rem; color:var(--text-secondary); display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+        .oc-bar { display:inline-block; width:70px; height:6px; border-radius:3px; background:#d6e9e4; overflow:hidden; }
+        .oc-bar > span { display:block; height:100%; background:#0f5c52; }
+        .oc-total { font-size:.8rem; margin-top:4px; }
+        .oc-tbl { width:100%; border-collapse:collapse; font-size:.82rem; margin-top:4px; }
+        .oc-tbl td { padding:3px 4px; border-bottom:1px solid var(--line); }
+        .oc-tbl .n { text-align:right; font-variant-numeric:tabular-nums; }
+        .oc-pty { color:var(--text-secondary); font-size:.72rem; width:2.6em; }
+        .oc-share { color:var(--text-secondary); width:4em; }
+        .oc-src, .oc-err { font-size:.72rem; color:var(--text-secondary); margin:8px 0 0; line-height:1.5; }
+        .oc-src a, .oc-err a { color:var(--text-secondary); }
         .gb { display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-top:10px; font-size:1.05rem; }
         .ed-notes { margin:10px 0 0; padding-left:18px; line-height:1.6; font-size:.9rem; }
         .ed-src { color:var(--text-secondary); font-size:.78rem; margin:12px 0 0; line-height:1.6; }

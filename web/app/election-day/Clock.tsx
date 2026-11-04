@@ -1,6 +1,27 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+
+/** Re-renders the server components (map, official counts) every minute
+ *  while the tab is visible, and right away when the tab comes back. */
+export function AutoRefresh({ everyMs = 60000 }: { everyMs?: number }) {
+  const router = useRouter();
+  useEffect(() => {
+    let last = Date.now();
+    const tick = () => {
+      if (document.visibilityState === "visible" && Date.now() - last >= everyMs - 1000) {
+        last = Date.now();
+        router.refresh();
+      }
+    };
+    const id = setInterval(tick, 5000);
+    const onVis = () => { if (document.visibilityState === "visible" && Date.now() - last > everyMs) tick(); };
+    document.addEventListener("visibilitychange", onVis);
+    return () => { clearInterval(id); document.removeEventListener("visibilitychange", onVis); };
+  }, [router, everyMs]);
+  return null;
+}
 
 // The only client-side code on the election night page: a ticking clock, a
 // countdown to the next poll closing, and per-wave open/closed badges. All of
