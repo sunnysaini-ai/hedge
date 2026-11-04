@@ -40,9 +40,14 @@ export type StateCount = {
 const UA = "Hedge election-night tracker (+https://choosehedge.com/election-day)";
 
 async function getText(url: string): Promise<{ text: string; lastModified: string | null }> {
-  const res = await fetch(url, {
+  // The states' CDNs (CloudFront, Akamai) hand plain requests a stale cached
+  // copy — on election night NC's edge was still serving a Nov 1 file. A
+  // per-minute cache-buster plus no-cache headers reaches the origin. This
+  // runs at most once a minute per file (see the cache at the bottom).
+  const bust = `${url.includes("?") ? "&" : "?"}hedge=${Math.floor(Date.now() / 60000)}`;
+  const res = await fetch(url + bust, {
     cache: "no-store", // caching happens one level up, on the parsed result
-    headers: { "User-Agent": UA },
+    headers: { "User-Agent": UA, "Cache-Control": "no-cache", Pragma: "no-cache" },
     signal: AbortSignal.timeout(9000),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -202,4 +207,4 @@ async function readAll(): Promise<StateCount[]> {
 }
 
 /** Parsed counts for every feed, cached 60 s across all visitors. */
-export const getOfficialCounts = unstable_cache(readAll, ["official-counts-20261103-v1"], { revalidate: 60 });
+export const getOfficialCounts = unstable_cache(readAll, ["official-counts-20261103-v2"], { revalidate: 60 });
