@@ -122,3 +122,22 @@ export const ELECTION_OFFICE: Record<string, string> = {
   WI: "https://elections.wi.gov/",
   WY: "https://sos.wyo.gov/Elections/Default.aspx",
 };
+
+// When to expect numbers — only states where a published source says
+// something specific. Paraphrased from Al Jazeera's Nov 3 2026 explainer
+// (https://www.aljazeera.com/news/2026/11/3/when-will-we-know-the-us-midterm-election-results),
+// which draws on 2024 reporting patterns. Past pace is a guide, not a promise.
+export const EXPECT_SOURCE = "https://www.aljazeera.com/news/2026/11/3/when-will-we-know-the-us-midterm-election-results";
+export const EXPECT: Record<string, string> = {
+  AK: "Mail ballots arrive over the following days, and a ranked-choice count may be needed later in November.",
+  AZ: "Mail ballots dropped off on Election Day need signature checks; close races can take several days.",
+  CA: "Mostly mail voting, verified over the following days; close races can take days or weeks.",
+  FL: "Usually counts fast: in 2024 about 99% was in within roughly three hours of polls closing.",
+  ME: "Ranked-choice: if no one clears 50%, ballots go to Augusta for further tabulation, which delays a final result.",
+  NV: "Mail ballots postmarked by today can arrive up to four days later, plus six days to fix signatures; could run into next week.",
+  NC: "Most mail ballots come in the first update; in 2024, 90% was reported by about 11:36 PM ET.",
+  OH: "Nearly all early and absentee votes come in the first update; in 2024, 90% was reported by about 11:03 PM ET.",
+  PA: "First numbers arrive at close; in 2024, 90% was reported by about 12:48 AM ET.",
+  WA: "Mail voting; ballots postmarked by today keep arriving and are counted over the following days.",
+  WI: "In 2024, 90% of results were in by about 2:22 AM ET.",
+};

@@ -9,7 +9,7 @@ import type { MapStatus } from "./mapStatus";
 import { COUNTED_STATES, FEED_META, getOfficialCounts } from "./feeds";
 import type { RaceCount, StateCount } from "./feeds";
 import type { ClosingEvent } from "./Clock";
-import { ELECTION_OFFICE, FIRST_CLOSE, STATE_NAMES, WAVES } from "./schedule";
+import { ELECTION_OFFICE, EXPECT, EXPECT_SOURCE, FIRST_CLOSE, STATE_NAMES, WAVES } from "./schedule";
 
 // Election night page, Nov 3 2026. Hedge's final polling averages laid out
 // along the poll-closing timeline, a neutral live map, and — for states whose
@@ -103,6 +103,58 @@ function fmtTime(iso: string | null) {
   return `${et} ET / ${pt} PT`;
 }
 
+function clockET(ms: number) {
+  return new Date(ms).toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+}
+function ago(ms: number) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  if (m < 1) return "just now";
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  return `${h} hr ${m % 60} min ago`;
+}
+function untilText(ms: number) {
+  const m = Math.max(1, Math.ceil(ms / 60000));
+  return m < 60 ? `in ${m} min` : `in ${Math.floor(m / 60)} hr ${m % 60} min`;
+}
+
+type Flag = { text: string; tone: "open" | "soon" | "closed" | "new" | "wait" | "warn" };
+
+const LAST_CLOSE_MS: Record<string, number> = {};
+for (const w of WAVES) for (const s of w.states) LAST_CLOSE_MS[s] = Date.parse(w.utc);
+const firstCloseMs = (s: string) => (FIRST_CLOSE[s] ? Date.parse(FIRST_CLOSE[s].utc) : LAST_CLOSE_MS[s]);
+
+/** Poll-closing flag for one state, from the schedule. */
+function pollFlag(s: string, now: number): Flag {
+  const first = firstCloseMs(s), last = LAST_CLOSE_MS[s];
+  if (now >= last) return { text: `Polls closed ${clockET(last)} ET`, tone: "closed" };
+  if (now >= first) return { text: `Partly closed · rest close ${clockET(last)} ET`, tone: "soon" };
+  const soon = first - now <= 30 * 60 * 1000;
+  return { text: `Polls close ${clockET(first)} ET · ${untilText(first - now)}`, tone: soon ? "soon" : "open" };
+}
+
+/** New-numbers flag for a state with an official feed: observed, never predicted. */
+function numbersFlag(s: string, now: number, c: StateCount | undefined): Flag | null {
+  if (!COUNTED_STATES.includes(s)) return null;
+  if (!c || c.error) return { text: "Official file unreachable right now", tone: "warn" };
+  const first = firstCloseMs(s);
+  const upd = c.fileUpdated ? Date.parse(c.fileUpdated) : NaN;
+  const race = c.races[0];
+  const pct = race && race.precinctsTotal ? Math.round((race.precinctsReporting / race.precinctsTotal) * 100) : 0;
+  if (now < first) return { text: "Official numbers start after polls close", tone: "open" };
+  if (Number.isFinite(upd) && upd >= first - 30 * 60 * 1000 && (race?.totalVotes ?? 0) > 0) {
+    return {
+      text: `New official numbers ${ago(now - upd)} · ${pct}% of precincts`,
+      tone: now - upd <= 15 * 60 * 1000 ? "new" : "closed",
+    };
+  }
+  return { text: "Waiting for first official numbers", tone: "wait" };
+}
+
+function FlagChip({ f }: { f: Flag }) {
+  return <span className={`flag flag-${f.tone}`}>{f.text}</span>;
+}
+
 function OfficialRace({ race }: { race: RaceCount }) {
   const pct = race.precinctsTotal ? (race.precinctsReporting / race.precinctsTotal) * 100 : 0;
   return (
@@ -188,6 +240,33 @@ export default async function ElectionDayPage() {
   const mapStatuses: Record<string, MapStatus> = {};
   for (const code of Object.keys(STATE_NAMES)) mapStatuses[code] = statusFor(code, now, countsByState);
 
+  // Tonight's flags: every closing moment from the schedule, plus every time a
+  // state with an official feed has posted numbers since its polls closed.
+  type FeedItem = { t: number; text: string; kind: "close" | "first" | "numbers" };
+  const feed: FeedItem[] = [];
+  for (const w of WAVES) {
+    feed.push({ t: Date.parse(w.utc), kind: "close", text: `Last polls close in ${w.states.map((x) => STATE_NAMES[x] ?? x).join(", ")}` });
+  }
+  const firstGroups: Record<string, string[]> = {};
+  for (const [st, f] of Object.entries(FIRST_CLOSE)) (firstGroups[f.utc] ??= []).push(st);
+  for (const [utc, sts] of Object.entries(firstGroups)) {
+    feed.push({ t: Date.parse(utc), kind: "first", text: `First polls close in ${sts.map((x) => STATE_NAMES[x] ?? x).join(", ")}` });
+  }
+  for (const st of COUNTED_STATES) {
+    const c = countsByState.get(st);
+    const nf = numbersFlag(st, now, c);
+    if (c && !c.error && c.fileUpdated && nf && (nf.tone === "new" || nf.tone === "closed") && nf.text.startsWith("New")) {
+      const r = c.races[0];
+      feed.push({
+        t: Date.parse(c.fileUpdated),
+        kind: "numbers",
+        text: `${STATE_NAMES[st]} posted official numbers: ${r.precinctsReporting.toLocaleString()} of ${r.precinctsTotal.toLocaleString()} precincts, ${r.totalVotes.toLocaleString()} votes counted (${OFFICE_LABEL[r.office]})`,
+      });
+    }
+  }
+  feed.sort((a, b) => a.t - b.t);
+  const nextIdx = feed.findIndex((f) => f.t > now);
+
   const byState: Record<string, RaceAverage[]> = {};
   for (const r of races) (byState[r.state] ??= []).push(r);
   for (const list of Object.values(byState)) list.sort((a, b) => OFFICE_ORDER[a.office] - OFFICE_ORDER[b.office]);
@@ -237,13 +316,40 @@ export default async function ElectionDayPage() {
       <NightClock events={events} totalStates={totalStates} />
 
       <section className="card">
+        <h2>Tonight's flags</h2>
+        <p className="ed-sub">
+          Every poll closing, plus each time a state with an official results file posts new numbers. Updates every minute.
+        </p>
+        <ol className="tf">
+          {feed.map((f, i) => {
+            const past = f.t <= now;
+            return (
+              <li key={`${f.t}-${i}`} className={`tf-item ${past ? "tf-past" : "tf-future"} ${i === nextIdx ? "tf-next" : ""} tf-${f.kind}`}>
+                <span className="tf-time">{clockET(f.t)} ET</span>
+                <span className="tf-dot" aria-hidden="true" />
+                <span className="tf-text">
+                  {i === nextIdx && <span className="tf-up">Next · {untilText(f.t - now)} · </span>}
+                  {f.kind === "numbers" && <span className="tf-tag">New numbers · </span>}
+                  {f.text}
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+        <p className="ed-src">
+          Expect most states to start posting soon after their polls close, but pace varies a lot: some count mail
+          ballots first, others last, and a few take days. State-by-state notes are in the timeline below.
+        </p>
+      </section>
+
+      <section className="card">
         <h2>Where the count stands</h2>
         <p className="ed-sub">
           Neutral colors only — this map shows counting progress, not who is ahead. Tap a state for its races.
         </p>
         <CountMap statuses={mapStatuses} />
 
-        <h3 className="oc-h">Official counts so far</h3>
+        <h3 className="oc-h" id="official-counts">Official counts so far</h3>
         <p className="ed-sub">
           Read directly from each state's official election-night results file, refreshed every minute.
           Unofficial until certified. "Precincts reporting" is what states publish — it is not the share of
@@ -325,6 +431,15 @@ export default async function ElectionDayPage() {
                       </a>
                     )}
                   </div>
+                  <div className="st-flags">
+                    <FlagChip f={pollFlag(s, now)} />
+                    {(() => {
+                      const nf = numbersFlag(s, now, countsByState.get(s));
+                      return nf ? <FlagChip f={nf} /> : null;
+                    })()}
+                    {COUNTED_STATES.includes(s) && <a className="st-jump" href="#official-counts">See official counts</a>}
+                  </div>
+                  {EXPECT[s] && <p className="st-expect"><b>What to expect:</b> {EXPECT[s]}</p>}
                   <div className="rr-list">
                     {byState[s].map((r) => <RaceRow key={r.office} r={r} />)}
                   </div>
@@ -382,7 +497,9 @@ export default async function ElectionDayPage() {
           <a href="https://www.fec.gov/introduction-campaign-finance/how-to-research-public-records/state-election-offices" target="_blank" rel="noopener noreferrer">
             FEC directory of state election offices
           </a>. Vote counts: official results files from the NC State Board of Elections, Florida Division of
-          Elections and Minnesota Secretary of State. Averages: Hedge, see <a href="/methodology">methodology</a>.
+          Elections and Minnesota Secretary of State. "What to expect" notes: paraphrased from{" "}
+          <a href={EXPECT_SOURCE} target="_blank" rel="noopener noreferrer">Al Jazeera's results-timing guide</a>, based on
+          2024 patterns. Averages: Hedge, see <a href="/methodology">methodology</a>.
         </p>
       </section>
 
@@ -430,6 +547,29 @@ export default async function ElectionDayPage() {
         .wave-others a { color:var(--text-secondary); }
         .wave-nr { font-style:italic; }
 
+        .flag { display:inline-block; font-size:.7rem; font-weight:600; line-height:1.6; padding:1px 9px;
+          border-radius:999px; white-space:nowrap; }
+        .flag-open { background:#eceae4; color:#3d3c39; }
+        .flag-soon { background:#fbecd9; color:#8a4b12; }
+        .flag-closed { background:#e1dfd9; color:#2f2e2b; }
+        .flag-new { background:#0f5c52; color:#fff; }
+        .flag-wait { background:#e4efec; color:#0f5c52; }
+        .flag-warn { background:#f7e0dc; color:#8a2c1f; }
+        .st-flags { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:5px; }
+        .st-jump { font-size:.74rem; color:var(--text-secondary); }
+        .st-expect { font-size:.78rem; color:var(--text-secondary); margin:5px 0 2px; line-height:1.45; }
+        .st-expect b { color:var(--text-primary); font-weight:600; }
+        .tf { list-style:none; margin:10px 0 0; padding:0; }
+        .tf-item { display:grid; grid-template-columns:6.4em 14px 1fr; align-items:baseline; gap:8px; padding:5px 0; font-size:.86rem; }
+        .tf-time { font-variant-numeric:tabular-nums; color:var(--text-secondary); font-size:.78rem; white-space:nowrap; }
+        .tf-dot { width:9px; height:9px; border-radius:50%; background:#c9c7c0; align-self:center; }
+        .tf-past .tf-dot { background:#3d3c39; }
+        .tf-numbers .tf-dot { background:#0f5c52; }
+        .tf-future { color:var(--text-secondary); }
+        .tf-next { color:var(--text-primary); font-weight:600; }
+        .tf-next .tf-dot { background:#e0a04a; box-shadow:0 0 0 3px #fbecd9; }
+        .tf-up { color:#8a4b12; }
+        .tf-tag { color:#0f5c52; font-weight:600; }
         .oc-h { margin:20px 0 0; font-size:1rem; }
         .oc-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; margin-top:10px; }
         .oc-card { border:1px solid var(--line); border-radius:10px; padding:12px 14px; background:var(--surface-0); }
