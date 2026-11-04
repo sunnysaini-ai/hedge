@@ -3,7 +3,9 @@ import { supabase } from "../../lib/supabase";
 import type { GenericBallotDay, RaceAverage } from "../../lib/supabase";
 import { formatGrade } from "../grades";
 import { AutoRefresh, NightClock, WaveStatus } from "./Clock";
-import CountMap, { statusFor } from "./CountMap";
+import CountMap from "./CountMap";
+import { statusFor } from "./mapStatus";
+import type { MapStatus } from "./mapStatus";
 import { COUNTED_STATES, FEED_META, getOfficialCounts } from "./feeds";
 import type { RaceCount, StateCount } from "./feeds";
 import type { ClosingEvent } from "./Clock";
@@ -94,7 +96,9 @@ async function getData() {
 function fmtTime(iso: string | null) {
   if (!iso) return "—";
   const d = new Date(iso);
-  const et = d.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
+  const dayET = (x: Date) => x.toLocaleDateString("en-US", { timeZone: "America/New_York", month: "short", day: "numeric" });
+  const datePart = dayET(d) === dayET(new Date()) ? "" : `${dayET(d)}, `;
+  const et = datePart + d.toLocaleTimeString("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
   const pt = d.toLocaleTimeString("en-US", { timeZone: "America/Los_Angeles", hour: "numeric", minute: "2-digit" });
   return `${et} ET / ${pt} PT`;
 }
@@ -114,7 +118,7 @@ function OfficialRace({ race }: { race: RaceCount }) {
       <div className="oc-total">{race.totalVotes.toLocaleString()} votes counted</div>
       <table className="oc-tbl">
         <tbody>
-          {race.candidates.filter((c) => c.party !== "O" || c.votes > 0 || race.totalVotes === 0).map((c) => (
+          {race.candidates.filter((c) => c.party !== "O" || c.votes > 0).map((c) => (
             <tr key={`${c.name}-${c.partyLabel}`}>
               <td className={c.party === "D" ? "rr-d" : c.party === "R" ? "rr-r" : ""}>{c.name}</td>
               <td className="oc-pty">{c.partyLabel}</td>
@@ -124,6 +128,10 @@ function OfficialRace({ race }: { race: RaceCount }) {
           ))}
         </tbody>
       </table>
+      {(() => {
+        const hidden = race.candidates.filter((c) => c.party === "O" && c.votes === 0).length;
+        return hidden > 0 ? <div className="oc-more">+{hidden} other candidate{hidden === 1 ? "" : "s"} with no votes reported yet</div> : null;
+      })()}
     </div>
   );
 }
@@ -177,6 +185,8 @@ export default async function ElectionDayPage() {
   const { races, generic, counts } = await getData();
   const now = Date.now();
   const countsByState = new Map(counts.map((c) => [c.state, c]));
+  const mapStatuses: Record<string, MapStatus> = {};
+  for (const code of Object.keys(STATE_NAMES)) mapStatuses[code] = statusFor(code, now, countsByState);
 
   const byState: Record<string, RaceAverage[]> = {};
   for (const r of races) (byState[r.state] ??= []).push(r);
@@ -231,7 +241,7 @@ export default async function ElectionDayPage() {
         <p className="ed-sub">
           Neutral colors only — this map shows counting progress, not who is ahead. Tap a state for its races.
         </p>
-        <CountMap counts={counts} now={now} />
+        <CountMap statuses={mapStatuses} />
 
         <h3 className="oc-h">Official counts so far</h3>
         <p className="ed-sub">
@@ -438,6 +448,7 @@ export default async function ElectionDayPage() {
         .oc-tbl .n { text-align:right; font-variant-numeric:tabular-nums; }
         .oc-pty { color:var(--text-secondary); font-size:.72rem; width:2.6em; }
         .oc-share { color:var(--text-secondary); width:4em; }
+        .oc-more { font-size:.72rem; color:var(--text-secondary); margin-top:4px; }
         .oc-src, .oc-err { font-size:.72rem; color:var(--text-secondary); margin:8px 0 0; line-height:1.5; }
         .oc-src a, .oc-err a { color:var(--text-secondary); }
         .gb { display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-top:10px; font-size:1.05rem; }
